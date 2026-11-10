@@ -1,0 +1,132 @@
+name: Android arm64 APK
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+
+jobs:
+  android-arm64:
+    name: Build signed arm64-v8a APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read application version
+        id: version
+        shell: bash
+        run: echo "value=$(node -p "require('./src-tauri/tauri.conf.json').version")" >> "$GITHUB_OUTPUT"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare Android SDK and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android-arm64
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Initialize Android project
+        run: pnpm tauri android init --ci
+
+      - name: Build aarch64 APK
+        run: pnpm tauri android build --apk --split-per-abi --target aarch64
+
+      - name: Sign and verify arm64-v8a APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          VERSION: ${{ steps.version.outputs.value }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in KEYSTORE_BASE64 KEY_ALIAS STORE_PASSWORD KEY_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing required secret: $name"
+              exit 1
+            fi
+          done
+
+          KEYSTORE="$RUNNER_TEMP/HGhub-release.keystore"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/36.0.0/apksigner"
+          mkdir -p artifacts
+
+          mapfile -t APKS < <(find src-tauri/gen/android/app/build/outputs/apk -type f \( -name '*aarch64*-release*.apk' -o -name '*arm64*-release*.apk' \))
+          if [ "${#APKS[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one arm64 APK, found ${#APKS[@]}"
+            find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -print || true
+            exit 1
+          fi
+
+          OUTPUT="artifacts/HGhub_${VERSION}_arm64-v8a.apk"
+          "$APKSIGNER" sign \
+            --ks "$KEYSTORE" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "pass:$STORE_PASSWORD" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            --v4-signing-enabled false \
+            --out "$OUTPUT" \
+            "${APKS[0]}"
+
+          "$APKSIGNER" verify --verbose --print-certs "$OUTPUT"
+          rm -f "$KEYSTORE"
+          sha256sum "$OUTPUT" | tee "$OUTPUT.sha256"
+
+      - name: Upload signed arm64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-android-arm64-v8a
+          path: |
+            artifacts/HGhub_*_arm64-v8a.apk
+            artifacts/HGhub_*_arm64-v8a.apk.sha256
+          if-no-files-found: error
+          retention-days: 30

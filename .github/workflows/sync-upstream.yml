@@ -1,0 +1,55 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Merge upstream and retain fork automation
+        env:
+          GH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p "$RUNNER_TEMP/hghub-workflows"
+          cp .github/workflows/sync-upstream.yml "$RUNNER_TEMP/hghub-workflows/"
+          cp .github/workflows/android-arm64.yml "$RUNNER_TEMP/hghub-workflows/"
+
+          git remote add upstream https://github.com/Minireel/HGhub.git
+          git fetch upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Fork is already up to date."
+            exit 0
+          fi
+
+          git merge --no-edit -X theirs upstream/main
+
+          cp "$RUNNER_TEMP/hghub-workflows/sync-upstream.yml" .github/workflows/
+          cp "$RUNNER_TEMP/hghub-workflows/android-arm64.yml" .github/workflows/
+          git add .github/workflows/sync-upstream.yml .github/workflows/android-arm64.yml
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: retain fork automation after upstream sync"
+          fi
+
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin HEAD:main
