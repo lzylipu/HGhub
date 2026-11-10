@@ -1,8 +1,9 @@
-name: Sync upstream
+name: Sync upstream and build Android APK
 
 on:
   schedule:
-    - cron: "23 2 * * *"
+    # GitHub Actions 使用 UTC；北京时间每天凌晨 5:00 = UTC 前一天 21:00。
+    - cron: "0 21 * * *"
   workflow_dispatch:
 
 permissions:
@@ -15,6 +16,8 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.sync.outputs.updated }}
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
@@ -22,7 +25,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Merge upstream and retain fork automation
+      - name: Merge upstream and retain Android-only automation
+        id: sync
         env:
           GH_TOKEN: ${{ secrets.PUSH_TOKEN }}
         run: |
@@ -37,19 +41,50 @@ jobs:
           git remote add upstream https://github.com/Minireel/HGhub.git
           git fetch upstream main
 
-          if git merge-base --is-ancestor upstream/main HEAD; then
-            echo "Fork is already up to date."
+          # 上游可能撤下源码，只保留说明文件。此时绝不能把本地复刻源码合并掉。
+          if ! git cat-file -e upstream/main:src-tauri/tauri.conf.json \
+            || ! git cat-file -e upstream/main:package.json \
+            || ! git cat-file -e upstream/main:src; then
+            echo "Upstream no longer contains the application source; keeping the fork source unchanged."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          SOURCE_CHANGED=false
+          if ! git diff --quiet HEAD...upstream/main -- src src-tauri scripts package.json pnpm-lock.yaml pnpm-workspace.yaml; then
+            SOURCE_CHANGED=true
+          fi
+
+          if [ "$SOURCE_CHANGED" = false ]; then
+            echo "Upstream application source has no updates; no APK rebuild is needed."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          OLD_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
           git merge --no-edit -X theirs upstream/main
+          UPSTREAM_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          if [ "$UPSTREAM_VERSION" = "$OLD_VERSION" ]; then
+            IFS=. read -r MAJOR MINOR PATCH <<< "$OLD_VERSION"
+            NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+            node -e "const fs=require('fs');for(const p of ['src-tauri/tauri.conf.json','package.json']){const j=JSON.parse(fs.readFileSync(p));j.version=process.argv[1];fs.writeFileSync(p,JSON.stringify(j,null,2)+'\\n')}" "$NEW_VERSION"
+            git add src-tauri/tauri.conf.json package.json
+            git commit -m "chore: bump version to $NEW_VERSION after upstream sync"
+          fi
 
           cp "$RUNNER_TEMP/hghub-workflows/sync-upstream.yml" .github/workflows/
           cp "$RUNNER_TEMP/hghub-workflows/android-arm64.yml" .github/workflows/
           git add .github/workflows/sync-upstream.yml .github/workflows/android-arm64.yml
           if ! git diff --cached --quiet; then
-            git commit -m "chore: retain fork automation after upstream sync"
+            git commit -m "chore: retain Android-only automation after upstream sync"
           fi
 
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push origin HEAD:main
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+
+  build-android:
+    needs: sync
+    if: needs.sync.outputs.updated == 'true'
+    uses: ./.github/workflows/android-arm64.yml
+    secrets: inherit

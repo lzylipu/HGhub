@@ -1,13 +1,11 @@
 name: Android arm64 APK
 
 on:
-  push:
-    branches:
-      - main
+  workflow_call:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: android-arm64-${{ github.ref }}
@@ -129,4 +127,25 @@ jobs:
             artifacts/HGhub_*_arm64-v8a.apk
             artifacts/HGhub_*_arm64-v8a.apk.sha256
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
+
+      - name: Publish Android-only GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}-android"
+          APK="artifacts/HGhub_${VERSION}_arm64-v8a.apk"
+          SHA_FILE="${APK}.sha256"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" "$SHA_FILE" --clobber
+            gh release edit "$TAG" --title "HGhub v${VERSION} Android arm64" --latest
+          else
+            gh release create "$TAG" "$APK" "$SHA_FILE" \
+              --title "HGhub v${VERSION} Android arm64" \
+              --notes "Android arm64-v8a APK。SHA-256 校验值见同名 .sha256 文件。" \
+              --latest
+          fi
